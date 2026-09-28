@@ -1,0 +1,153 @@
+# WAH 拍卖行捡漏插件 — Bug 审计与赚钱能力强化 计划书
+
+日期：2026-09-28
+对象：c:\Users\101292\OneDrive - Grundfos\Documents\Workspace\Ah
+
+## 核查方法
+所有结论均已对照真实代码行号验证。
+
+---
+
+## 一、已确认缺陷清单
+
+### P0-1 商品（commodity）购买通道完全缺失 —— 最致命
+- 位置：`addon/WoWderhoiAH/Trade.lua:280-361`（startBuy / finalizeBuy）
+        `addon/WoWderhoiAH/Trade.lua:686-710`（事件注册）
+- 现状：只用 `MakeItemKey` + `QueryForItem` + `GetNumItemSearchResults`
+        + `GetItemSearchResultInfo` + `PlaceBuyout`；
+        只注册 `ITEM_SEARCH_RESULTS_UPDATED`。
+- 证据：全仓库 grep `Commodit` 命中 0。
+- 缺失 API：`GetNumCommoditySearchResults` / `GetCommoditySearchResultInfo` /
+        `StartCommoditiesPurchase` / `ConfirmCommoditiesPurchase`；
+        事件 `COMMODITY_SEARCH_RESULTS_UPDATED` / `COMMODITY_PRICE_UPDATED` /
+        `COMMODITY_PURCHASE_SUCCEEDED`。
+- 后果：零售 AH 中草药/矿石/布/附魔材料/药水全部是 commodity。
+        雷达能扫出这些捡漏，但点"买"必然落到 numResults == 0 → 弹 NO_BUYABLE。
+        **利润最稳的一半市场完全买不到。**
+
+### P0-2 PlaceBuyout 返回值被丢弃 + 异步成交未确认
+- 位置：`addon/WoWderhoiAH/Trade.lua:352-361`
+- 现状：`pcall(C_AuctionHouse.PlaceBuyout, ...)` 结果未接；
+        紧接着无条件 `chatMessage(L.BOUGHT, ...)` 并调用 `repriceAfterPurchase`。
+- 问题：PlaceBuyout 是异步的，真成交要等 `AUCTION_HOUSE_PURCHASE_COMPLETED`。
+- 后果：失败时（金币不足／被抢先／服务器限流）双重伤害 ——
+        谎报成功，且把本地扫描条目改贵或直接 `scan[itemId] = nil`
+        （`Trade.lua:371-385`），等于把真实便宜货自己藏起来，
+        直到下一次全量扫描（约 15 分钟）。
+
+### P1-3 捡漏利润未扣 5% 拍卖行手续费
+- 已有定义：`src/lib/crafting.ts:26`、`src/lib/recipe-profits.ts:65`
+        （两处各自定义 AH_CUT = 0.05 并正确使用）
+- 缺失位置：`src/lib/analytics.ts:143`（vendor 类）
+            `src/lib/analytics.ts:181`（med7 类）
+            `addon/WoWderhoiAH/Trade.lua:210` / `Trade.lua:233`
+            —— `profit = med7 - minPrice` 是毛利。
+- 关键影响：不只是数字虚高。榜单按 profit 降序排序，
+        而 (0.95*med7 - minPrice) 与 (med7 - minPrice) **不同序**
+        → 榜单顺序本身就是错的。
+- 注意：vendor 类卖给 NPC 无手续费，必须保持不扣（区别对待）。
+
+### P1-4 无新鲜度闸门
+- 位置：`src/lib/analytics.ts:110-192`（buildDealRadar）不检查快照年龄。
+- `src/lib/freshness.ts:7` 的 stale（>2h）目前只用于界面展示文案。
+- med7 类因 `med7Samples >= 3` 间接有点保护，但 3-7 天前的一批快照仍可凑够样本；
+  **vendor 类完全无历史要求**，一条 3 天前的扫描照样上榜。
+- 后果：按早就成交掉的价格跑空趟。
+
+### P2-5 规则单一真相源已破（两端分类可不一致）
+- 位置：`scripts/gen-lua-rules.ts:13-16` 只解构导出 10 个字段。
+- `src/lib/market-rules.ts:13-29` 的 minPrice / maxPrice / gapFilterOn /
+  gap1Pct / gap2Pct 不在导出之列，`GeneratedRules.lua` 里没有。
+- 漂移测试 `scripts/gen-lua-rules.test.ts` 因此仍是绿的 —— 它测的是生成器自身。
+- 后果：网页 `analytics.ts:120-121` 用 `(rules as any).minPrice` 做过滤，
+  游戏内 `refreshDeals` 完全不过滤 → 同一次扫描两端结果不同，
+  直接违反文件头注释声明的契约。
+
+### P2-6 游戏内雷达参数面板是空壳
+- 位置：`addon/WoWderhoiAH/Settings.lua:108-109`
+        `local RADAR_NUMERIC = {}` / `local RADAR_CHECKS = {}`
+- 全文件只有这两处赋值，第 186 / 201 行的 ipairs 循环**永远零次迭代**。
+- 后果：Options 面板里一个雷达参数控件都没有；
+        注释里"Route 2：游戏内面板是权威"是死的。
+- 待确认：`addon/test/settings-radar.test.ts:125-165` 直接取 `panel.radarBoxes[1]`，
+        这几个用例当前是红的还是被 stub 静默吞掉。
+
+### P2-7 规则只有 addon → web 单向
+- `scripts/watch-savedvars.ts:30, 92-111` 把 settings.radar 推给网页。
+- 网页 RadarParamsPanel 改的值落到 DB / localStorage，**永远回不到游戏里**。
+- 叠加 P2-6：游戏内规则永久冻结在编译默认值。
+
+### P2-8 网页价格过滤器写了两遍且口径不一致
+- 服务端：`src/app/page.tsx:68-69` mergeRadarRules(storedRules) → buildDealRadar，
+          按 `signal.price`（P10）过滤。
+- 客户端：`src/components/deal-radar-table.tsx:38-67` 读同一组 localStorage 键，
+          按 `deal.minPrice`（最低挂价）过滤。
+- 两个数据源（DB vs localStorage）+ 两个比较字段（P10 vs minPrice）会互相打架。
+- `src/components/radar-params-panel.tsx:11-16` 收了 initialRules 却完全没用它
+  初始化这四个字段，永远从 localStorage 默认 0 起步。
+
+### P3 稳健性 / 性能 / 观测
+- `WoWderhoiAH.lua:318` `while #pruned > 192 do table.remove(pruned, 1) end` → O(n²)。
+- `Trade.lua:338` `local quantity = info.quantity or info.quantity` 重复写。
+- `repriceAfterPurchase`（`Trade.lua:371-385`）只改 minPrice / numAuctions，
+  不动 quantity / marketPrice / sellP / ladder → 条目内部自相矛盾。
+- `Trade.lua:96-104` money() 金币分支丢掉铜数（纯显示层）。
+- 全仓库无任何成交 / 持仓 / 盈亏记录
+  （grep `purchaseLog|costBasis|realized` 命中 0）
+  → 没有反馈闭环，无法验证哪套参数真的赚钱。
+
+---
+
+## 二、分阶段方案
+
+### 阶段 A：修复买入通道（P0，必须先做，阻塞其余）
+- A1 拆分 item / commodity 两条购买路径
+- A2 成交确认改为事件驱动，repriceAfterPurchase 只在确认成交后执行
+- A3 失败路径给出明确原因文案（金币不足 / 被抢先 / 限流）
+- A4 测试：扩展 `addon/test/trade-buy.test.ts`，
+     在 `addon/test/wow-stub.lua` 补 commodity API 桩
+
+### 阶段 B：利润口径纠正（P1，依赖 A）
+- B1 `market-rules.ts` 新增 ahCut = 0.05，
+     `crafting.ts:26` / `recipe-profits.ts:65` 改为引用它（消除三处重复定义）
+- B2 `analytics.ts` 与 `Trade.lua` 的 med7 类 profit 改为净利；vendor 类保持毛利
+- B3 新鲜度闸门：buildDealRadar 增加 now + maxAgeMinutes，过期快照不进榜；
+     refreshDeals 用 `WoWderhoiAH_ScanData.scannedAt` 同样处理
+- B4 测试：analytics / deal-radar 两端同步更新期望值
+
+### 阶段 C：规则单一真相源归位（P2，可与 B 并行）
+- C1 `gen-lua-rules.ts` 补齐 5 个缺失字段并重新生成 GeneratedRules.lua
+- C2 refreshDeals 实现 minPrice / maxPrice / gap 过滤，与 TS 同口径
+- C3 填充 RADAR_NUMERIC / RADAR_CHECKS，恢复游戏内面板
+- C4 统一网页过滤：服务端为唯一权威，客户端只做展示；
+     RadarParamsPanel 用 initialRules 初始化
+- C5 漂移测试改为断言「Lua 常量表字段集 == dealRadarRules 键集」
+
+### 阶段 D：赚钱能力增强（依赖 A / B）
+- D1 深度感知捡漏：用已有 ladder（5 档）算「吃掉前 N 档后的加权均价」，
+     只推净利仍达标的量，避免只有 1 件的诱饵单
+- D2 榜单增加 ROI / 资金占用列，支持按净利率排序
+- D3 成交账本：记录买入价、数量、时间；卖出后回填，算实测胜率
+- D4 基于账本的参数回测，用真实数据定 minProfitRatio / discount
+
+### 阶段 E：清理（P3，随手）
+- E1 pruned 截断改为一次性切片
+- E2 删除 `info.quantity or info.quantity`
+- E3 repriceAfterPurchase 同步修正其余字段
+- E4 money() 金币分支补铜数
+
+---
+
+## 三、明确不做
+- 不改中位数口径（已验证两端一致且保守）
+- 不改 supplyShrink 逻辑（已验证两端一致）
+- 不引入自动化批量扫货（封号风险 + 违反服务器规则）
+- 不动 AHledger 通道的数据口径
+
+---
+
+## 四、待决策
+1. 阶段 D 的成交账本要不要做？改动最大，但它是「稳定赚钱」唯一的验证手段 ——
+   没有它，所有参数调整都是盲调。建议做。
+2. 手续费只改显示，还是同时改排序和门槛判定？建议一起改，否则排序仍是错的。
+3. 新鲜度上限取值：建议直接复用 `freshness.ts` 的 2 小时常量，避免又多一个魔数。
